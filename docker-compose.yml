@@ -1,0 +1,11 @@
+services:
+  asterisk:
+    image: andrius/asterisk:latest
+    container_name: asterisk-server
+    network_mode: host
+    volumes:
+      - ./config/pjsip.conf:/etc/asterisk/pjsip.conf
+      - ./config/extensions.conf:/etc/asterisk/extensions.conf
+      - ./config/http.conf:/etc/asterisk/http.conf
+      - ./config/ari.conf:/etc/asterisk/ari.conf
+    restart: unless-stopped
