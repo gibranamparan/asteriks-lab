@@ -18,9 +18,6 @@ use tracing::{error, info, warn};
 
 const DEBOUNCE_SECONDS: u64 = 10;
 const FULL_SYNC_INTERVAL_SECONDS: u64 = 3600;
-const PJSIP_FILE_PATH: &str = "/config/pjsip.conf";
-const PJSIP_LAST_GOOD_PATH: &str = "/config/pjsip.conf.last-good";
-const PJSIP_BACKUP_DIR: &str = "/config/backups";
 const SHARED_PASSWORD: &str = "Sentrics2026";
 const ASTERISK_CONTAINER: &str = "asterisk-server";
 
@@ -31,6 +28,9 @@ struct AppConfig {
     amqp_exchange_type: String,
     amqp_queue: String,
     amqp_routing_key: String,
+    amqp_username: String,
+    amqp_password: String,
+    pjsip_base_dir: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -66,15 +66,33 @@ impl AppConfig {
             amqp_queue: required_env("HEADEND_AMQP_QUEUE")?,
             amqp_routing_key: env::var("HEADEND_AMQP_ROUTING_KEY")
                 .unwrap_or_else(|_| "#".to_string()),
+            amqp_username: required_env("HEADEND_AMQP_USERNAME")?,
+            amqp_password: required_env("HEADEND_AMQP_PASSWORD")?,
+            pjsip_base_dir: PathBuf::from(required_env("PJSIP_BASE_DIR")?),
         })
     }
 
     fn amqp_url(&self) -> String {
-        format!("amqp://{}:5672", self.headend_url)
+        format!(
+            "amqp://{}:{}@{}:5672",
+            self.amqp_username, self.amqp_password, self.headend_url
+        )
     }
 
     fn graphql_url(&self) -> String {
         format!("http://{}:5000/graphql", self.headend_url)
+    }
+
+    fn pjsip_file_path(&self) -> PathBuf {
+        self.pjsip_base_dir.join("pjsip.conf")
+    }
+
+    fn pjsip_last_good_path(&self) -> PathBuf {
+        self.pjsip_base_dir.join("pjsip.conf.last-good")
+    }
+
+    fn pjsip_backup_dir(&self) -> PathBuf {
+        self.pjsip_base_dir.join("backups")
     }
 
     fn exchange_kind(&self) -> ExchangeKind {
@@ -106,7 +124,7 @@ async fn main() -> Result<()> {
             return Err(err);
         }
     };
-    ensure_paths()?;
+    ensure_paths(&cfg)?;
 
     info!(
         amqp_url = %cfg.amqp_url(),
@@ -257,16 +275,16 @@ async fn run_sync(cfg: &AppConfig) -> Result<()> {
     let intercoms = fetch_intercoms(cfg).await?;
     let rendered = render_pjsip_conf(&intercoms);
 
-    if !should_apply(&rendered)? {
+    if !should_apply(cfg, &rendered)? {
         info!("Generated pjsip.conf is unchanged. Skipping apply");
         return Ok(());
     }
 
-    apply_config(&rendered)?;
+    apply_config(cfg, &rendered)?;
 
     if let Err(err) = apply_to_asterisk().await {
         error!(error = %err, "pjsip reload failed. Restoring last good config and restarting container");
-        restore_last_good()?;
+        restore_last_good(cfg)?;
         restart_asterisk_container().await?;
     }
 
@@ -357,39 +375,39 @@ fn render_pjsip_conf(intercoms: &[Intercom]) -> String {
     out
 }
 
-fn apply_config(content: &str) -> Result<()> {
-    let pjsip_path = Path::new(PJSIP_FILE_PATH);
-    let backup_dir = Path::new(PJSIP_BACKUP_DIR);
-    let last_good_path = Path::new(PJSIP_LAST_GOOD_PATH);
+fn apply_config(cfg: &AppConfig, content: &str) -> Result<()> {
+    let pjsip_path = cfg.pjsip_file_path();
+    let backup_dir = cfg.pjsip_backup_dir();
+    let last_good_path = cfg.pjsip_last_good_path();
 
     if pjsip_path.exists() {
         let ts = unix_timestamp_secs();
         let backup_file = backup_dir.join(format!("pjsip.conf.{ts}.bak"));
-        fs::copy(pjsip_path, &backup_file)
+        fs::copy(&pjsip_path, &backup_file)
             .with_context(|| format!("Failed backup copy to {}", backup_file.display()))?;
-        fs::copy(pjsip_path, last_good_path)
+        fs::copy(&pjsip_path, &last_good_path)
             .with_context(|| format!("Failed to refresh {}", last_good_path.display()))?;
     }
 
-    let temp_path = tmp_path_in_same_dir(pjsip_path)?;
+    let temp_path = tmp_path_in_same_dir(&pjsip_path)?;
     fs::write(&temp_path, content)
         .with_context(|| format!("Failed writing {}", temp_path.display()))?;
-    fs::rename(&temp_path, pjsip_path)
+    fs::rename(&temp_path, &pjsip_path)
         .with_context(|| format!("Failed swapping {}", pjsip_path.display()))?;
 
-    cleanup_old_backups(backup_dir, 20)?;
+    cleanup_old_backups(&backup_dir, 20)?;
     Ok(())
 }
 
-fn restore_last_good() -> Result<()> {
-    let src = Path::new(PJSIP_LAST_GOOD_PATH);
-    let dst = Path::new(PJSIP_FILE_PATH);
+fn restore_last_good(cfg: &AppConfig) -> Result<()> {
+    let src = cfg.pjsip_last_good_path();
+    let dst = cfg.pjsip_file_path();
 
     if !src.exists() {
         return Err(anyhow!("No last-good pjsip file found"));
     }
 
-    fs::copy(src, dst).with_context(|| {
+    fs::copy(&src, &dst).with_context(|| {
         format!(
             "Failed restoring last-good config from {} to {}",
             src.display(),
@@ -413,9 +431,22 @@ async fn apply_to_asterisk() -> Result<()> {
         .await
         .context("Failed to execute pjsip reload")?;
 
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    info!(
+        status = ?output.status.code(),
+        stdout = %stdout,
+        stderr = %stderr,
+        "pjsip reload command completed"
+    );
+
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("pjsip reload command failed: {stderr}"));
+        return Err(anyhow!(
+            "pjsip reload command failed (status={:?}, stdout='{}', stderr='{}')",
+            output.status.code(),
+            stdout,
+            stderr
+        ));
     }
 
     Ok(())
@@ -428,16 +459,29 @@ async fn restart_asterisk_container() -> Result<()> {
         .await
         .context("Failed to execute docker restart")?;
 
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    info!(
+        status = ?output.status.code(),
+        stdout = %stdout,
+        stderr = %stderr,
+        "docker restart command completed"
+    );
+
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("docker restart failed: {stderr}"));
+        return Err(anyhow!(
+            "docker restart failed (status={:?}, stdout='{}', stderr='{}')",
+            output.status.code(),
+            stdout,
+            stderr
+        ));
     }
 
     Ok(())
 }
 
-fn ensure_paths() -> Result<()> {
-    let pjsip = Path::new(PJSIP_FILE_PATH);
+fn ensure_paths(cfg: &AppConfig) -> Result<()> {
+    let pjsip = cfg.pjsip_file_path();
     let config_dir = pjsip
         .parent()
         .ok_or_else(|| anyhow!("Invalid pjsip file path"))?;
@@ -445,8 +489,9 @@ fn ensure_paths() -> Result<()> {
     fs::create_dir_all(config_dir)
         .with_context(|| format!("Failed to create config dir {}", config_dir.display()))?;
 
-    fs::create_dir_all(PJSIP_BACKUP_DIR)
-        .with_context(|| format!("Failed to create backup dir {}", PJSIP_BACKUP_DIR))?;
+    let backup_dir = cfg.pjsip_backup_dir();
+    fs::create_dir_all(&backup_dir)
+        .with_context(|| format!("Failed to create backup dir {}", backup_dir.display()))?;
 
     Ok(())
 }
@@ -464,14 +509,14 @@ fn tmp_path_in_same_dir(target: &Path) -> Result<PathBuf> {
     Ok(parent.join(format!(".{filename}.tmp")))
 }
 
-fn should_apply(new_content: &str) -> Result<bool> {
-    let path = Path::new(PJSIP_FILE_PATH);
+fn should_apply(cfg: &AppConfig, new_content: &str) -> Result<bool> {
+    let path = cfg.pjsip_file_path();
     if !path.exists() {
         return Ok(true);
     }
 
     let existing =
-        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
+        fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
 
     Ok(hash_str(&existing) != hash_str(new_content))
 }
