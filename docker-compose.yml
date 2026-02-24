@@ -9,3 +9,24 @@ services:
       - ./config/http.conf:/etc/asterisk/http.conf
       - ./config/ari.conf:/etc/asterisk/ari.conf
     restart: unless-stopped
+
+  intercom-sync-agent:
+    build:
+      context: ./agent
+      dockerfile: Dockerfile
+    container_name: intercom-sync-agent
+    network_mode: host
+    depends_on:
+      - asterisk
+    env_file:
+      - .env
+    environment:
+      HEADEND_URL: ${HEADEND_URL}
+      HEADEND_AMQP_EXCHANGE: ${HEADEND_AMQP_EXCHANGE}
+      HEADEND_AMQP_EXCHANGE_TYPE: ${HEADEND_AMQP_EXCHANGE_TYPE}
+      HEADEND_AMQP_QUEUE: ${HEADEND_AMQP_QUEUE}
+      HEADEND_AMQP_ROUTING_KEY: ${HEADEND_AMQP_ROUTING_KEY}
+    volumes:
+      - ./config:/config
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped

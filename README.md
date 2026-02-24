@@ -1,1 +1,94 @@
 # asteriks-lab
+
+This project runs Asterisk plus a Rust sidecar agent that syncs `intercom` data from HEADEND events into [`config/pjsip.conf`](config/pjsip.conf).
+
+## Services
+
+- [`asterisk`](docker-compose.yml:2): PBX container (`andrius/asterisk:latest`)
+- [`intercom-sync-agent`](docker-compose.yml:13): Rust agent that:
+  - subscribes to AMQP queue bindings
+  - filters `intercom` create/update/delete events
+  - fetches full intercom list from GraphQL
+  - regenerates `pjsip.conf`
+  - safely applies/rolls back config
+  - reloads PJSIP (and restarts Asterisk if reload fails)
+
+## Required environment variables
+
+Loaded from [`.env`](.env) via [`env_file`](docker-compose.yml:21) and passed through in [`docker-compose.yml`](docker-compose.yml:23):
+
+- `HEADEND_URL` (host/IP only, no scheme)
+- `HEADEND_AMQP_EXCHANGE`
+- `HEADEND_AMQP_EXCHANGE_TYPE`
+- `HEADEND_AMQP_QUEUE`
+- `HEADEND_AMQP_ROUTING_KEY`
+
+No defaults are provided in compose interpolation. Missing or empty values will cause startup/config failure, and the agent logs the exact reason in [`required_env()`](agent/src/main.rs:527) and startup config validation in [`main()`](agent/src/main.rs:112).
+
+Derived endpoints inside the agent (from `HEADEND_URL`):
+
+- AMQP: `amqp://<HEADEND_URL>:5672`
+- GraphQL: `http://<HEADEND_URL>:5000/graphql`
+
+## Agent behavior
+
+Implemented in [`agent/src/main.rs`](agent/src/main.rs:1).
+
+- Event schema expected from queue message body:
+  - `id: string`
+  - `event: string`
+  - `resource: string`
+- Relevant events: `resource == "intercom"` and `event in {create, update, delete}`
+- Debounce window: internal constant `10s`
+- Periodic full reconciliation: internal constant `3600s`
+- Startup sync: runs once at boot
+
+## pjsip generation and safe apply
+
+Paths (hardcoded by design):
+
+- active: `/config/pjsip.conf`
+- last good: `/config/pjsip.conf.last-good`
+- rolling backups: `/config/backups`
+
+Generation details:
+
+- username is normalized MAC (lowercase, no `:`)
+- shared password is currently hardcoded as `Sentrics2026`
+- output is deterministic (sorted by normalized MAC)
+- unchanged file content is skipped (hash compare)
+
+Apply/rollback flow:
+
+1. backup current config
+2. atomic swap with newly generated config
+3. run `docker exec asterisk-server asterisk -rx "pjsip reload"`
+4. on failure: restore `last-good` and run `docker restart asterisk-server`
+
+## Run
+
+Start stack:
+
+```bash
+./asterisk.sh start
+```
+
+Stop stack:
+
+```bash
+./asterisk.sh stop
+```
+
+Follow logs:
+
+```bash
+./asterisk.sh logs
+```
+
+## Notes / good practices already included
+
+- Debounce to avoid excessive reload/restart churn
+- Full periodic reconciliation to correct drift
+- Last-good rollback protection
+- Backup retention cleanup (keeps newest 20 backups)
+- Startup reconciliation so restarts converge quickly

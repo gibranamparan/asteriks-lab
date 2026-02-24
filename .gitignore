@@ -1,0 +1,20 @@
+# Rust build artifacts
+target/
+agent/target/
+
+# Rust/Cargo temporary files
+**/*.rs.bk
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Logs and local runtime artifacts
+*.log
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
