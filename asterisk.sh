@@ -14,6 +14,9 @@ case "$1" in
         docker compose -f "$COMPOSE_FILE" down
         docker compose -f "$COMPOSE_FILE" up -d
         ;;
+    agent-rebuild)
+        docker compose -f "$COMPOSE_FILE" up -d --build intercom-sync-agent
+        ;;
     logs)
         docker compose -f "$COMPOSE_FILE" logs -f
         ;;
@@ -58,6 +61,7 @@ case "$1" in
         echo "  start       Start the Asterisk container"
         echo "  stop        Stop the Asterisk container"
         echo "  restart     Restart the Asterisk container"
+        echo "  agent-rebuild Rebuild and restart intercom-sync-agent only"
         echo "  logs        Follow container logs"
         echo "  status      Show container status"
         echo "  cli         Open Asterisk CLI"

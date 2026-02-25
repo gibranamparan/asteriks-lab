@@ -8,6 +8,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -31,11 +32,11 @@ struct AppConfig {
     amqp_username: String,
     amqp_password: String,
     pjsip_base_dir: PathBuf,
+    pjsip_backup_dir: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
 struct QueueEvent {
-    id: String,
     event: String,
     resource: String,
 }
@@ -69,6 +70,7 @@ impl AppConfig {
             amqp_username: required_env("HEADEND_AMQP_USERNAME")?,
             amqp_password: required_env("HEADEND_AMQP_PASSWORD")?,
             pjsip_base_dir: PathBuf::from(required_env("PJSIP_BASE_DIR")?),
+            pjsip_backup_dir: PathBuf::from(required_env("PJSIP_BACKUP_DIR")?),
         })
     }
 
@@ -92,7 +94,7 @@ impl AppConfig {
     }
 
     fn pjsip_backup_dir(&self) -> PathBuf {
-        self.pjsip_base_dir.join("backups")
+        self.pjsip_backup_dir.clone()
     }
 
     fn exchange_kind(&self) -> ExchangeKind {
@@ -124,7 +126,21 @@ async fn main() -> Result<()> {
             return Err(err);
         }
     };
+
+    // Print effective configuration at startup for easier debugging of environment issues.
+    info!(
+        amqp_exchange = %cfg.amqp_exchange,
+        amqp_exchange_type = %cfg.amqp_exchange_type,
+        amqp_queue = %cfg.amqp_queue,
+        amqp_routing_key = %cfg.amqp_routing_key,
+        pjsip_file_path = %cfg.pjsip_file_path().display(),
+        pjsip_backup_dir = %cfg.pjsip_backup_dir().display(),
+        "Effective configuration"
+    );
+
     ensure_paths(&cfg)?;
+
+    wait_for_asterisk_health().await;
 
     info!(
         amqp_url = %cfg.amqp_url(),
@@ -149,7 +165,13 @@ async fn main() -> Result<()> {
         .exchange_declare(
             &cfg.amqp_exchange,
             cfg.exchange_kind(),
-            ExchangeDeclareOptions::default(),
+            ExchangeDeclareOptions {
+                durable: true,
+                auto_delete: false,
+                internal: false,
+                nowait: false,
+                passive: false,
+            },
             FieldTable::default(),
         )
         .await
@@ -158,7 +180,13 @@ async fn main() -> Result<()> {
     channel
         .queue_declare(
             &cfg.amqp_queue,
-            QueueDeclareOptions::default(),
+            QueueDeclareOptions {
+                durable: false,
+                auto_delete: false,
+                exclusive: false,
+                nowait: false,
+                passive: false,
+            },
             FieldTable::default(),
         )
         .await
@@ -212,7 +240,12 @@ async fn main() -> Result<()> {
                                 }
                             }
                             Err(err) => {
-                                warn!(error = %err, "Dropping malformed event");
+                                let payload_str = String::from_utf8_lossy(&delivery.data);
+                                warn!(
+                                    error = %err,
+                                    payload = %payload_str,
+                                    "Dropping malformed event"
+                                );
                             }
                         }
 
@@ -255,20 +288,20 @@ fn handle_delivery(body: &[u8]) -> Result<bool> {
     let event: QueueEvent = serde_json::from_slice(body).context("Invalid event JSON")?;
 
     if is_relevant_event(&event) {
-        info!(id = %event.id, event = %event.event, resource = %event.resource, "Relevant intercom event received");
+        info!(event = %event.event, resource = %event.resource, "Relevant intercom event received");
         Ok(true)
     } else {
-        info!(id = %event.id, event = %event.event, resource = %event.resource, "Ignoring non-relevant event");
+        info!(event = %event.event, resource = %event.resource, "Ignoring non-relevant event");
         Ok(false)
     }
 }
 
 fn is_relevant_event(event: &QueueEvent) -> bool {
-    if event.resource != "intercom" {
+    if event.resource != "intercoms" {
         return false;
     }
 
-    matches!(event.event.as_str(), "create" | "update" | "delete")
+    matches!(event.event.as_str(), "created" | "updated" | "deleted")
 }
 
 async fn run_sync(cfg: &AppConfig) -> Result<()> {
@@ -389,11 +422,17 @@ fn apply_config(cfg: &AppConfig, content: &str) -> Result<()> {
             .with_context(|| format!("Failed to refresh {}", last_good_path.display()))?;
     }
 
-    let temp_path = tmp_path_in_same_dir(&pjsip_path)?;
-    fs::write(&temp_path, content)
-        .with_context(|| format!("Failed writing {}", temp_path.display()))?;
-    fs::rename(&temp_path, &pjsip_path)
-        .with_context(|| format!("Failed swapping {}", pjsip_path.display()))?;
+    // Write in-place to preserve inode for single-file bind mounts.
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&pjsip_path)
+        .with_context(|| format!("Failed opening {} for write", pjsip_path.display()))?;
+    file.write_all(content.as_bytes())
+        .with_context(|| format!("Failed writing {}", pjsip_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("Failed syncing {}", pjsip_path.display()))?;
 
     cleanup_old_backups(&backup_dir, 20)?;
     Ok(())
@@ -419,30 +458,45 @@ fn restore_last_good(cfg: &AppConfig) -> Result<()> {
 }
 
 async fn apply_to_asterisk() -> Result<()> {
+    match run_asterisk_cli("pjsip reload").await {
+        Ok(()) => Ok(()),
+        Err(first_err) => {
+            warn!(error = %first_err, "'pjsip reload' failed, trying module reload fallback");
+            run_asterisk_cli("module reload res_pjsip.so").await
+        }
+    }
+}
+
+async fn run_asterisk_cli(command: &str) -> Result<()> {
     let output = Command::new("docker")
-        .args([
-            "exec",
-            ASTERISK_CONTAINER,
-            "asterisk",
-            "-rx",
-            "pjsip reload",
-        ])
+        .args(["exec", ASTERISK_CONTAINER, "asterisk", "-rx", command])
         .output()
         .await
-        .context("Failed to execute pjsip reload")?;
+        .with_context(|| format!("Failed to execute Asterisk CLI command: {command}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     info!(
+        command,
         status = ?output.status.code(),
         stdout = %stdout,
         stderr = %stderr,
-        "pjsip reload command completed"
+        "Asterisk CLI command completed"
     );
+
+    if stdout.contains("No such command") {
+        return Err(anyhow!(
+            "Asterisk CLI command not recognized command='{}' (stdout='{}', stderr='{}')",
+            command,
+            stdout,
+            stderr
+        ));
+    }
 
     if !output.status.success() {
         return Err(anyhow!(
-            "pjsip reload command failed (status={:?}, stdout='{}', stderr='{}')",
+            "Asterisk CLI command failed command='{}' (status={:?}, stdout='{}', stderr='{}')",
+            command,
             output.status.code(),
             stdout,
             stderr
@@ -450,6 +504,50 @@ async fn apply_to_asterisk() -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn wait_for_asterisk_health() {
+    loop {
+        let output = Command::new("docker")
+            .args([
+                "exec",
+                ASTERISK_CONTAINER,
+                "asterisk",
+                "-rx",
+                "pjsip show endpoints",
+            ])
+            .output()
+            .await;
+
+        match output {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+                if output.status.success() {
+                    info!(
+                        status = ?output.status.code(),
+                        stdout = %stdout,
+                        stderr = %stderr,
+                        "Asterisk health check passed"
+                    );
+                    break;
+                }
+
+                warn!(
+                    status = ?output.status.code(),
+                    stdout = %stdout,
+                    stderr = %stderr,
+                    "Asterisk health check failed. Retrying in 1s"
+                );
+            }
+            Err(err) => {
+                warn!(error = %err, "Asterisk health check command failed. Retrying in 1s");
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 async fn restart_asterisk_container() -> Result<()> {
@@ -494,19 +592,6 @@ fn ensure_paths(cfg: &AppConfig) -> Result<()> {
         .with_context(|| format!("Failed to create backup dir {}", backup_dir.display()))?;
 
     Ok(())
-}
-
-fn tmp_path_in_same_dir(target: &Path) -> Result<PathBuf> {
-    let parent = target
-        .parent()
-        .ok_or_else(|| anyhow!("Target path has no parent"))?;
-
-    let filename = target
-        .file_name()
-        .and_then(|f| f.to_str())
-        .ok_or_else(|| anyhow!("Invalid target filename"))?;
-
-    Ok(parent.join(format!(".{filename}.tmp")))
 }
 
 fn should_apply(cfg: &AppConfig, new_content: &str) -> Result<bool> {

@@ -29,7 +29,9 @@ services:
       HEADEND_AMQP_USERNAME: ${HEADEND_AMQP_USERNAME}
       HEADEND_AMQP_PASSWORD: ${HEADEND_AMQP_PASSWORD}
       PJSIP_BASE_DIR: ${PJSIP_BASE_DIR}
+      PJSIP_BACKUP_DIR: ${PJSIP_BACKUP_DIR}
     volumes:
       - ./config:/config
+      - ./backups:/backups
       - /var/run/docker.sock:/var/run/docker.sock
     restart: unless-stopped

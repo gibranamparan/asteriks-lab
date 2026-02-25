@@ -1,4 +1,7 @@
-config/backups/
+
+config/pjsip.conf
+config/pjsip.conf.last-good
+backups/
 
 # Rust build artifacts
 target/
